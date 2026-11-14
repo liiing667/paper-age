@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+- Enforce a shared 1900-byte plaintext budget for file, standard input, and
+  the convenience library API; oversized inputs now fail before encryption
+  instead of being fully buffered and failing later during QR code generation
+- Write PDF output through a temporary file followed by an atomic rename so
+  that a failed write (e.g. a full disk) no longer truncates an existing
+  backup
 - Update printpdf to v0.12.6
 
 ## [1.5.0] - 2026-02-24

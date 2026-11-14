@@ -6,12 +6,14 @@ use std::io::BufRead;
 use age::secrecy::SecretString;
 
 use crate::builder;
-use crate::encryption;
+use crate::encryption::{self, EncryptionError};
 use crate::page::PageSize;
 
 /// Errors that can occur during PDF generation
 #[derive(Debug)]
 pub enum PaperAgeError {
+    /// The plaintext exceeds the shared input size budget
+    InputTooLarge(String),
     /// The plaintext data could not be encrypted
     Encryption(String),
     /// The PDF document could not be initialized
@@ -23,6 +25,7 @@ pub enum PaperAgeError {
 impl fmt::Display for PaperAgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            PaperAgeError::InputTooLarge(msg) => write!(f, "Input too large: {msg}"),
             PaperAgeError::Encryption(msg) => write!(f, "Encryption failed: {msg}"),
             PaperAgeError::DocumentInit(msg) => write!(f, "Document initialization failed: {msg}"),
             PaperAgeError::PdfCreation(msg) => write!(f, "PDF creation failed: {msg}"),
@@ -85,7 +88,10 @@ pub fn create_pdf(
     let passphrase_secret = SecretString::from(passphrase.to_owned());
 
     let (_plaintext_len, encrypted) = encryption::encrypt_plaintext(data, passphrase_secret)
-        .map_err(|e| PaperAgeError::Encryption(e.to_string()))?;
+        .map_err(|e| match e {
+            EncryptionError::InputTooLarge { .. } => PaperAgeError::InputTooLarge(e.to_string()),
+            other => PaperAgeError::Encryption(other.to_string()),
+        })?;
 
     let pdf = builder::Document::new(title, page_size)
         .map_err(|e| PaperAgeError::DocumentInit(e.to_string()))?;
@@ -148,6 +154,10 @@ mod tests {
     #[test]
     fn test_error_display() {
         assert_eq!(
+            PaperAgeError::InputTooLarge("too big".to_string()).to_string(),
+            "Input too large: too big"
+        );
+        assert_eq!(
             PaperAgeError::Encryption("bad key".to_string()).to_string(),
             "Encryption failed: bad key"
         );
@@ -159,5 +169,41 @@ mod tests {
             PaperAgeError::PdfCreation("QR too large".to_string()).to_string(),
             "PDF creation failed: QR too large"
         );
+    }
+
+    #[test]
+    fn test_create_pdf_rejects_oversized_input() {
+        let data = vec![b'z'; encryption::MAX_PLAINTEXT_LEN + 1];
+        let mut reader = &data[..];
+
+        let result = create_pdf(
+            "Too Big".to_string(),
+            &mut reader,
+            "passphrase",
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(matches!(result, Err(PaperAgeError::InputTooLarge(_))));
+    }
+
+    #[test]
+    fn test_create_pdf_accepts_maximum_sized_input() {
+        let data = vec![b'z'; encryption::MAX_PLAINTEXT_LEN];
+        let mut reader = &data[..];
+
+        let result = create_pdf(
+            "Max Size".to_string(),
+            &mut reader,
+            "passphrase",
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(result.is_ok());
     }
 }

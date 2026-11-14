@@ -7,13 +7,16 @@
 use std::{
     env,
     fs::File,
-    io::{self, stdin, BufReader, BufWriter, Read, Write},
+    io::{self, stdin, BufReader, BufWriter, Write},
     path::PathBuf,
 };
 
 use age::secrecy::{ExposeSecret, SecretString};
 use clap::Parser;
-use paper_age::{builder, cli, encryption};
+use paper_age::{
+    builder, cli,
+    encryption::{self, EncryptionError},
+};
 use qrcode::types::QrError;
 use rpassword::prompt_password;
 
@@ -58,25 +61,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(p) => p,
         None => PathBuf::from("-"),
     };
-    let mut reader: BufReader<Box<dyn Read>> = {
+    let mut reader: BufReader<Box<dyn std::io::Read>> = {
         if path.to_string_lossy() == "-" {
             BufReader::new(Box::new(stdin().lock()))
         } else if path.is_file() {
-            let size = path.metadata()?.len();
-            if size >= 2048 {
-                warn!("File too large ({size:?} bytes). The maximum file size is about 1.9 KiB.");
-            }
-            BufReader::new(Box::new(File::open(&path).unwrap()))
+            BufReader::new(Box::new(File::open(&path)?))
         } else {
             error!("File not found: {}", path.display());
             std::process::exit(exitcode::NOINPUT);
         }
     };
 
+    // Read the plaintext against the shared byte budget before asking for a
+    // passphrase or encrypting anything. Oversized inputs fail closed here so
+    // that neither encryption nor PDF generation runs on them.
+    let plaintext = match encryption::read_bounded(&mut reader, encryption::MAX_PLAINTEXT_LEN) {
+        Ok(plaintext) => plaintext,
+        Err(EncryptionError::InputTooLarge { length, limit }) => {
+            error!(
+                "Input is too large ({length} bytes). The maximum input size is {limit} bytes (~1.9 KiB)."
+            );
+            std::process::exit(exitcode::DATAERR);
+        }
+        Err(EncryptionError::Io(error)) => {
+            return Err(error.into());
+        }
+    };
+
     let passphrase = get_passphrase()?;
 
     // Encrypt the plaintext to a ciphertext using the passphrase...
-    let (plaintext_len, encrypted) = encryption::encrypt_plaintext(&mut reader, passphrase)?;
+    let (plaintext_len, encrypted) =
+        encryption::encrypt_plaintext(&mut plaintext.as_slice(), passphrase)?;
 
     info!("Plaintext length: {plaintext_len:?} bytes");
     info!("Encrypted length: {:?} bytes", encrypted.len());
@@ -100,10 +116,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         debug!("Writing to STDOUT");
         io::stdout().write_all(&bytes)?;
     } else {
-        debug!("Writing to file: {}", output.to_string_lossy());
-        let file = File::create(output)?;
-        BufWriter::new(file).write_all(&bytes)?;
+        write_file_atomically(&output, &bytes)?;
     }
+
+    Ok(())
+}
+
+/// Write `bytes` to `path` atomically.
+///
+/// The bytes are first written and flushed into a temporary file in the same
+/// directory and then renamed over the destination. A failure while writing
+/// (for example a full disk) leaves any existing file untouched and removes
+/// the partial temporary file instead of truncating the old backup in place.
+fn write_file_atomically(path: &PathBuf, bytes: &[u8]) -> io::Result<()> {
+    debug!("Writing to file: {}", path.to_string_lossy());
+
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let directory = parent.unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid output file name"))?;
+
+    let unique = format!(
+        ".{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    );
+    let temp_path = directory.join(unique);
+
+    struct TempFileGuard {
+        path: PathBuf,
+    }
+
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    let guard = TempFileGuard {
+        path: temp_path.clone(),
+    };
+
+    {
+        let file = File::create(&temp_path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(bytes)?;
+        writer.into_inner()?.sync_all()?;
+    }
+
+    std::fs::rename(&temp_path, path)?;
+
+    std::mem::forget(guard);
 
     Ok(())
 }
@@ -141,6 +209,55 @@ fn get_passphrase() -> Result<SecretString, io::Error> {
 mod tests {
     use super::*;
     use age::secrecy::ExposeSecret;
+    use assert_fs::prelude::*;
+
+    #[test]
+    fn test_write_file_atomically_replaces_existing_file() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let path = temp.child("output.pdf");
+        path.write_binary(b"old backup").unwrap();
+
+        write_file_atomically(&path.to_path_buf(), b"new backup").unwrap();
+
+        assert_eq!(std::fs::read(path.path()).unwrap(), b"new backup");
+
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn test_write_file_atomically_keeps_old_file_on_failure() {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let path = temp.child("output.pdf");
+        path.write_binary(b"old backup").unwrap();
+
+        // Pointing the destination at a read-only directory makes the
+        // temporary file creation fail before the destination is touched.
+        let readonly_dir = temp.child("readonly");
+        readonly_dir.create_dir_all().unwrap();
+        let mut permissions = std::fs::metadata(readonly_dir.path())
+            .unwrap()
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(readonly_dir.path(), permissions).unwrap();
+
+        let destination = readonly_dir.path().join("output.pdf");
+        let result = write_file_atomically(&destination, b"new backup");
+        assert!(result.is_err());
+
+        assert_eq!(std::fs::read(path.path()).unwrap(), b"old backup");
+
+        let leftovers: Vec<_> = std::fs::read_dir(readonly_dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert!(leftovers.is_empty());
+    }
 
     #[test]
     fn test_get_passphrase_from_env() -> Result<(), Box<dyn std::error::Error>> {
